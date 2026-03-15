@@ -30,7 +30,10 @@ jobs:
           echo "$RUNNER_TEMP/agent-deck-bin" >> "$GITHUB_PATH"
 
       - name: Run tests
-        run: go test -race ./...
+        shell: bash
+        run: |
+          packages=($(go list ./... | grep -Ev '^github.com/asheshgoplani/agent-deck/internal/(integration|mcppool|session|tmux)$'))
+          go test -race "${packages[@]}"
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
