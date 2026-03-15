@@ -276,7 +276,7 @@ Agent Deck works with any terminal-based AI tool:
 **Works on:** macOS, Linux, Windows (WSL)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/qzchenwl/agent-deck/main/install.sh | bash
 ```
 
 Then run: `agent-deck`
@@ -286,17 +286,17 @@ Then run: `agent-deck`
 
 **Homebrew**
 ```bash
-brew install asheshgoplani/tap/agent-deck
+brew install qzchenwl/tap/agent-deck
 ```
 
 **Go**
 ```bash
-go install github.com/asheshgoplani/agent-deck/cmd/agent-deck@latest
+go install github.com/qzchenwl/agent-deck/cmd/agent-deck@latest
 ```
 
 **From Source**
 ```bash
-git clone https://github.com/asheshgoplani/agent-deck.git && cd agent-deck && make install
+git clone https://github.com/qzchenwl/agent-deck.git && cd agent-deck && make install
 ```
 
 </details>
@@ -399,7 +399,7 @@ Additional resources:
 
 Agent Deck checks for updates automatically.
 - Standalone/manual install: run `agent-deck update` to install.
-- Homebrew install: run `brew upgrade asheshgoplani/tap/agent-deck`.
+- Homebrew install: run `brew upgrade qzchenwl/tap/agent-deck`.
 - Optional: set `auto_update = true` in [config.toml](skills/agent-deck/references/config-reference.md) for automatic update prompts.
 
 ## FAQ

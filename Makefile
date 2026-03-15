@@ -86,4 +86,4 @@ release-local:
 	@echo "=== Running GoReleaser ==="
 	goreleaser release --clean
 	@echo "=== Release complete ==="
-	@echo "Verify: gh release view $$(git describe --tags --exact-match) --repo asheshgoplani/agent-deck"
+	@echo "Verify: gh release view $$(git describe --tags --exact-match) --repo qzchenwl/agent-deck"
