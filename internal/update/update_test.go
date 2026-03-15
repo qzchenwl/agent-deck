@@ -200,19 +200,19 @@ func TestHomebrewUpgradeHint(t *testing.T) {
 			name:     "mac arm64 cellar",
 			path:     "/opt/homebrew/Cellar/agent-deck/0.19.14/bin/agent-deck",
 			wantOK:   true,
-			wantHint: "brew upgrade asheshgoplani/tap/agent-deck",
+			wantHint: "brew upgrade qzchenwl/tap/agent-deck",
 		},
 		{
 			name:     "mac intel cellar",
 			path:     "/usr/local/Cellar/agent-deck/0.19.14/bin/agent-deck",
 			wantOK:   true,
-			wantHint: "brew upgrade asheshgoplani/tap/agent-deck",
+			wantHint: "brew upgrade qzchenwl/tap/agent-deck",
 		},
 		{
 			name:     "linuxbrew cellar",
 			path:     "/home/linuxbrew/.linuxbrew/Cellar/agent-deck/0.19.14/bin/agent-deck",
 			wantOK:   true,
-			wantHint: "brew upgrade asheshgoplani/tap/agent-deck",
+			wantHint: "brew upgrade qzchenwl/tap/agent-deck",
 		},
 		{
 			name:   "standalone local binary",

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
 # Agent Deck Installer
-# https://github.com/asheshgoplani/agent-deck
+# https://github.com/qzchenwl/agent-deck
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/asheshgoplani/agent-deck/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/qzchenwl/agent-deck/main/install.sh | bash
 #
 # Options:
 #   --name <name>       Custom binary name (default: agent-deck)
@@ -39,7 +39,7 @@ NC='\033[0m' # No Color
 BINARY_NAME="agent-deck"
 INSTALL_DIR="${HOME}/.local/bin"
 VERSION="latest"
-REPO="asheshgoplani/agent-deck"
+REPO="qzchenwl/agent-deck"
 SKIP_TMUX_CONFIG=false
 SKIP_OPTIONAL_DEPS=false
 
@@ -621,7 +621,7 @@ configure_tmux() {
 $MARKER
 $VERSION_MARKER $CURRENT_VERSION
 # Added by agent-deck installer - $(date +%Y-%m-%d)
-# https://github.com/asheshgoplani/agent-deck
+# https://github.com/qzchenwl/agent-deck
 
 # Terminal with true color support
 set -g default-terminal \"tmux-256color\"

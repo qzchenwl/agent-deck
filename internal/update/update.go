@@ -19,7 +19,7 @@ import (
 
 const (
 	// GitHubRepo is the repository to check for updates
-	GitHubRepo = "asheshgoplani/agent-deck"
+	GitHubRepo = "qzchenwl/agent-deck"
 
 	// CacheFileName stores the last update check result
 	CacheFileName = "update-cache.json"
@@ -391,7 +391,7 @@ func HomebrewUpgradeHint(execPath string) (string, bool) {
 	}
 	for _, prefix := range knownCellars {
 		if strings.HasPrefix(clean, prefix) {
-			return "brew upgrade asheshgoplani/tap/agent-deck", true
+			return "brew upgrade qzchenwl/tap/agent-deck", true
 		}
 	}
 	return "", false
