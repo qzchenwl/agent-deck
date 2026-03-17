@@ -469,12 +469,48 @@ if ! curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/agent-deck.tar.gz"; then
     echo -e "${RED}Error: Download failed${NC}"
     echo "URL: $DOWNLOAD_URL"
     echo ""
-    echo "This could mean:"
-    echo "  - The version doesn't exist"
-    echo "  - The release hasn't been published yet"
-    echo "  - Network issues"
+
+    # Check if the release exists but has no assets (common when GoReleaser hasn't completed yet)
+    RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/tags/${VERSION}" 2>/dev/null || true)
+
+    # Parse asset list: prefer jq for reliability, fall back to grep
+    if command -v jq &> /dev/null && [[ -n "$RELEASE_JSON" ]]; then
+        ASSET_NAMES=$(echo "$RELEASE_JSON" | jq -r '.assets[].name // empty' 2>/dev/null || true)
+        ASSET_COUNT=$(echo "$RELEASE_JSON" | jq '.assets | length' 2>/dev/null || echo "0")
+    else
+        ASSET_NAMES=$(echo "$RELEASE_JSON" | grep '"name"' | sed 's/.*"name": *"\([^"]*\)".*/\1/' | grep '\.tar\.gz\|checksums' || true)
+        ASSET_COUNT=$(echo "$RELEASE_JSON" | grep -c '"browser_download_url"' || echo "0")
+    fi
+
+    if [[ "$ASSET_COUNT" -eq 0 ]]; then
+        echo "The release ${VERSION} exists but has no downloadable binaries."
+        echo "This usually means the release CI workflow hasn't completed yet."
+        echo "Wait a few minutes and try again, or check: https://github.com/${REPO}/actions"
+    else
+        # Release has assets, but not for this platform
+        echo "The release ${VERSION} has ${ASSET_COUNT} assets, but not for ${OS}/${ARCH}."
+        if [[ -n "$ASSET_NAMES" ]]; then
+            echo ""
+            echo "Available assets:"
+            echo "$ASSET_NAMES" | while IFS= read -r name; do
+                [[ -n "$name" ]] && echo "  - $name"
+            done
+        fi
+        echo ""
+        echo "This could mean:"
+        echo "  - The version doesn't exist for your platform"
+        echo "  - Network issues"
+    fi
     echo ""
-    echo "Try building from source instead:"
+
+    # Suggest Homebrew first if available (most reliable)
+    if [[ "$OS" == "darwin" ]] && command -v brew &> /dev/null; then
+        echo "Install via Homebrew instead (recommended):"
+        echo "  brew install asheshgoplani/tap/agent-deck"
+        echo ""
+    fi
+
+    echo "Or build from source:"
     echo "  git clone https://github.com/${REPO}.git"
     echo "  cd agent-deck && make install"
     exit 1
@@ -515,7 +551,7 @@ configure_tmux() {
     local TMUX_CONF="$HOME/.tmux.conf"
     local MARKER="# agent-deck configuration"
     local VERSION_MARKER="# agent-deck-tmux-config-version:"
-    local CURRENT_VERSION="2"  # Bump this when config changes
+    local CURRENT_VERSION="3"  # Bump this when config changes
     local NEEDS_UPDATE=false
     local HAS_CONFIG=false
 
@@ -535,6 +571,7 @@ configure_tmux() {
             fi
             echo ""
             echo -e "${BLUE}What's new in this update:${NC}"
+            echo "  • Added extended-keys for Shift+Enter support (tmux 3.2+)"
             echo "  • Fixed mouse scrolling issues on WSL"
             echo "  • Added auto-enter copy-mode on scroll up"
             echo "  • Added explicit scroll bindings for copy-mode"
@@ -631,6 +668,9 @@ set -ag terminal-overrides \",*256col*:Tc\"
 # Performance
 set -sg escape-time 0
 set -g history-limit 50000
+
+# Extended keys: forward Shift+Enter and other modified keys to apps (tmux 3.2+)
+set -s extended-keys on
 
 # Mouse support (scroll + drag-to-copy)
 set -g mouse on

@@ -34,7 +34,7 @@ var (
 	mcpLog                      = logging.ForComponent(logging.CompMCP)
 	codexSessionIDPathPatternRE = regexp.MustCompile(`/.codex/sessions/\S*/rollout-\S*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl`)
 	uuidPatternRE               = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
-	geminiPromptRE              = regexp.MustCompile(`^(>|>>>|\$|❯|➜|gemini>)\s*$`)
+	geminiPromptRE              = regexp.MustCompile(`^(>|>>>|\$|❯|➜|gemini>|✦)\s*$`)
 	shellPromptRE               = regexp.MustCompile(`^[\s]*(>|>>>|\$|❯|➜|#|%)\s*$`)
 )
 
@@ -78,6 +78,12 @@ type Instance struct {
 	WorktreePath     string `json:"worktree_path,omitempty"`      // Path to worktree (if session is in worktree)
 	WorktreeRepoRoot string `json:"worktree_repo_root,omitempty"` // Original repo root
 	WorktreeBranch   string `json:"worktree_branch,omitempty"`    // Branch name in worktree
+
+	// Multi-repo support
+	MultiRepoEnabled   bool                `json:"multi_repo_enabled,omitempty"`
+	AdditionalPaths    []string            `json:"additional_paths,omitempty"`    // Paths beyond ProjectPath
+	MultiRepoTempDir   string              `json:"multi_repo_temp_dir,omitempty"` // Temp cwd for multi-repo sessions
+	MultiRepoWorktrees []MultiRepoWorktree `json:"multi_repo_worktrees,omitempty"`
 
 	Command        string    `json:"command"`
 	Wrapper        string    `json:"wrapper,omitempty"` // Optional wrapper command with {command} placeholder
@@ -190,6 +196,69 @@ type SandboxConfig struct {
 
 	// ExtraVolumes maps host paths to container paths for additional bind mounts.
 	ExtraVolumes map[string]string `json:"extra_volumes,omitempty"`
+}
+
+// resolveRealPath resolves symlinks to get the canonical path for comparison.
+// Falls back to the original path on error (e.g., path doesn't exist yet).
+func resolveRealPath(p string) string {
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		return real
+	}
+	return p
+}
+
+// DeduplicateDirnames returns unique directory names for the given paths.
+// When multiple paths share the same basename, a numeric suffix is appended (e.g., "src-1").
+func DeduplicateDirnames(paths []string) []string {
+	seen := make(map[string]int)
+	result := make([]string, len(paths))
+	for i, p := range paths {
+		dirname := filepath.Base(p)
+		if n := seen[dirname]; n > 0 {
+			result[i] = fmt.Sprintf("%s-%d", dirname, n)
+		} else {
+			result[i] = dirname
+		}
+		seen[dirname]++
+	}
+	return result
+}
+
+// MultiRepoWorktree tracks a worktree created for one repo in a multi-repo session.
+type MultiRepoWorktree struct {
+	OriginalPath string `json:"original_path"`
+	WorktreePath string `json:"worktree_path"`
+	RepoRoot     string `json:"repo_root"`
+	Branch       string `json:"branch"`
+}
+
+// IsMultiRepo returns true if this session has multi-repo mode enabled.
+func (inst *Instance) IsMultiRepo() bool {
+	return inst.MultiRepoEnabled
+}
+
+// AllProjectPaths returns all project paths: [ProjectPath] + AdditionalPaths.
+func (inst *Instance) AllProjectPaths() []string {
+	paths := []string{inst.ProjectPath}
+	paths = append(paths, inst.AdditionalPaths...)
+	return paths
+}
+
+// EffectiveWorkingDir returns the working directory for this session.
+// For multi-repo sessions, this is the temp dir; otherwise the ProjectPath.
+func (inst *Instance) EffectiveWorkingDir() string {
+	if inst.MultiRepoEnabled && inst.MultiRepoTempDir != "" {
+		return inst.MultiRepoTempDir
+	}
+	return inst.ProjectPath
+}
+
+// CleanupMultiRepoTempDir removes the multi-repo temporary directory.
+func (inst *Instance) CleanupMultiRepoTempDir() error {
+	if inst.MultiRepoTempDir == "" {
+		return nil
+	}
+	return os.RemoveAll(inst.MultiRepoTempDir)
 }
 
 // IsSandboxed returns true if this instance is configured to run in a Docker sandbox.
@@ -535,6 +604,23 @@ func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
 	// --add-dir: Grant subagent access to parent's project directory (for worktrees, etc.)
 	if i.ParentProjectPath != "" {
 		flags = append(flags, fmt.Sprintf("--add-dir %s", i.ParentProjectPath))
+	}
+
+	// Multi-repo: pass all project paths via --add-dir (deduplicated, excluding cwd)
+	if i.MultiRepoEnabled {
+		seen := make(map[string]bool)
+		if i.ParentProjectPath != "" {
+			seen[resolveRealPath(i.ParentProjectPath)] = true // already added above
+		}
+		seen[resolveRealPath(i.EffectiveWorkingDir())] = true // exclude cwd
+		for _, p := range i.AllProjectPaths() {
+			real := resolveRealPath(p)
+			if seen[real] {
+				continue
+			}
+			seen[real] = true
+			flags = append(flags, fmt.Sprintf("--add-dir %s", p))
+		}
 	}
 
 	// Options-level flags
@@ -2956,6 +3042,13 @@ func (i *Instance) GetLastResponse() (*ResponseOutput, error) {
 // 3. Scan disk for active session ID and retry.
 // 4. Fallback to terminal parsing.
 // 5. If still unavailable, return an empty response (no error).
+//
+// Behavior for Gemini (mirrors Claude):
+// 1. Try structured JSON read via stored GeminiSessionID.
+// 2. Refresh ID from tmux env and retry.
+// 3. Scan disk for latest session and retry.
+// 4. Fallback to terminal parsing.
+// 5. If still unavailable, return an empty response (no error).
 func (i *Instance) GetLastResponseBestEffort() (*ResponseOutput, error) {
 	resp, err := i.GetLastResponse()
 	if err == nil {
@@ -2982,6 +3075,25 @@ func (i *Instance) GetLastResponseBestEffort() (*ResponseOutput, error) {
 		}
 	}
 
+	// Gemini-specific recovery path (mirrors Claude recovery above)
+	if i.Tool == "gemini" {
+		// Refresh from tmux env (fast path)
+		i.syncGeminiSessionFromTmux()
+		if i.GeminiSessionID != "" {
+			if recovered, recoverErr := i.getGeminiLastResponse(); recoverErr == nil {
+				return recovered, nil
+			}
+		}
+
+		// Fallback: detect latest session on disk (handles startup race / stale ID)
+		i.syncGeminiSessionFromDisk()
+		if i.GeminiSessionID != "" {
+			if recovered, recoverErr := i.getGeminiLastResponse(); recoverErr == nil {
+				return recovered, nil
+			}
+		}
+	}
+
 	// Final fallback: terminal parsing (works for all tools).
 	if i.tmuxSession != nil {
 		if terminalResp, terminalErr := i.getTerminalLastResponse(); terminalErr == nil {
@@ -2989,10 +3101,14 @@ func (i *Instance) GetLastResponseBestEffort() (*ResponseOutput, error) {
 		}
 	}
 
-	// For Claude, prefer a graceful empty response instead of a hard error.
-	if IsClaudeCompatible(i.Tool) {
+	// For Claude and Gemini, prefer a graceful empty response instead of a hard error.
+	if IsClaudeCompatible(i.Tool) || i.Tool == "gemini" {
+		toolName := i.Tool
+		if IsClaudeCompatible(toolName) {
+			toolName = "claude"
+		}
 		return &ResponseOutput{
-			Tool:    "claude",
+			Tool:    toolName,
 			Role:    "assistant",
 			Content: "",
 		}, nil
@@ -4995,6 +5111,11 @@ func buildSandboxConfig(
 
 	if userCfg != nil && len(userCfg.Docker.EnvironmentValues) > 0 {
 		configOpts = append(configOpts, docker.WithEnvironment(userCfg.Docker.EnvironmentValues))
+	}
+
+	// Multi-repo: mount each path under /workspace/<dirname> instead of single project mount.
+	if inst.MultiRepoEnabled {
+		configOpts = append(configOpts, docker.WithMultiRepoPaths(inst.AllProjectPaths()))
 	}
 
 	return docker.NewContainerConfig(inst.ProjectPath, configOpts...)

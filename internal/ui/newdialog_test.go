@@ -246,7 +246,7 @@ func TestNewDialog_TabDoesNotOverwriteCustomPath(t *testing.T) {
 	d.SetPathSuggestions(suggestions)
 
 	// User is on path field (focusIndex 1)
-	d.focusIndex = 1
+	d.focusIndex = 2
 	d.updateFocus()
 
 	// User types a completely NEW path that doesn't match any suggestion
@@ -264,8 +264,8 @@ func TestNewDialog_TabDoesNotOverwriteCustomPath(t *testing.T) {
 	}
 
 	// Focus should have moved to command field
-	if d.focusIndex != 2 {
-		t.Errorf("focusIndex = %d, want 2 (command field)", d.focusIndex)
+	if d.focusIndex != 3 {
+		t.Errorf("focusIndex = %d, want 3 (command field)", d.focusIndex)
 	}
 }
 
@@ -282,7 +282,7 @@ func TestNewDialog_TabAppliesSuggestionWhenNavigated(t *testing.T) {
 	d.SetPathSuggestions(suggestions)
 
 	// User is on path field
-	d.focusIndex = 1
+	d.focusIndex = 2
 	d.updateFocus()
 
 	// User types something, then navigates to suggestion with Ctrl+N
@@ -316,7 +316,7 @@ func TestNewDialog_TypingResetsSuggestionNavigation(t *testing.T) {
 	}
 	d.SetPathSuggestions(suggestions)
 
-	d.focusIndex = 1
+	d.focusIndex = 2
 	d.updateFocus()
 
 	// User navigates to a suggestion
@@ -619,8 +619,9 @@ func TestNewDialog_WorktreeToggle_ViaKeyPress(t *testing.T) {
 	dialog.Show()
 	dialog.sandboxEnabled = false
 	dialog.inheritedSettings = nil
+	dialog.commandCursor = 1 // preset command (not custom input)
 	dialog.rebuildFocusTargets()
-	dialog.focusIndex = 2 // Command field
+	dialog.focusIndex = 3 // Command field
 
 	// Press 'w' to toggle worktree.
 	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
@@ -635,11 +636,51 @@ func TestNewDialog_WorktreeToggle_ViaKeyPress(t *testing.T) {
 	}
 
 	// Press 'w' again to disable (need to be on command field).
-	dialog.focusIndex = 2
+	dialog.focusIndex = 3
 	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
 
 	if dialog.worktreeEnabled {
 		t.Error("Worktree should be disabled after pressing 'w' again")
+	}
+}
+
+func TestNewDialog_ShortcutsBlockedDuringTextInput(t *testing.T) {
+	dialog := NewNewDialog()
+	dialog.Show()
+	dialog.sandboxEnabled = false
+	dialog.inheritedSettings = nil
+	dialog.commandCursor = 0 // custom command input (text field active)
+	dialog.rebuildFocusTargets()
+
+	// Navigate to command field.
+	cmdIdx := dialog.indexOf(focusCommand)
+	dialog.focusIndex = cmdIdx
+	dialog.updateFocus()
+
+	// Press 's' — should NOT toggle sandbox when custom command input is focused.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if dialog.sandboxEnabled {
+		t.Error("Pressing 's' on custom command input should type, not toggle sandbox")
+	}
+
+	// Press 'w' — should NOT toggle worktree.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	if dialog.worktreeEnabled {
+		t.Error("Pressing 'w' on custom command input should type, not toggle worktree")
+	}
+
+	// Press 'm' — should NOT toggle multi-repo.
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+	if dialog.multiRepoEnabled {
+		t.Error("Pressing 'm' on custom command input should type, not toggle multi-repo")
+	}
+
+	// Also verify shortcuts don't fire on name field.
+	dialog.focusIndex = 0 // focusName
+	dialog.updateFocus()
+	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	if dialog.sandboxEnabled {
+		t.Error("Pressing 's' on name input should not toggle sandbox")
 	}
 }
 
@@ -704,7 +745,7 @@ func TestNewDialog_View_ShowsWorktreeCheckbox(t *testing.T) {
 	dialog := NewNewDialog()
 	dialog.SetSize(80, 40)
 	dialog.Show()
-	dialog.focusIndex = 2 // Command field
+	dialog.focusIndex = 3 // Command field
 
 	view := dialog.View()
 
@@ -833,7 +874,7 @@ func TestNewDialog_WorktreeCheckbox_SpaceToggle(t *testing.T) {
 	dialog.sandboxEnabled = false
 	dialog.inheritedSettings = nil
 	dialog.rebuildFocusTargets()
-	dialog.focusIndex = 3 // Worktree checkbox
+	dialog.focusIndex = 4 // Worktree checkbox
 
 	// Space toggles worktree on.
 	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
@@ -848,7 +889,7 @@ func TestNewDialog_WorktreeCheckbox_SpaceToggle(t *testing.T) {
 	}
 
 	// Navigate back and space again to disable.
-	dialog.focusIndex = 3
+	dialog.focusIndex = 4
 	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
 
 	if dialog.worktreeEnabled {
@@ -860,7 +901,7 @@ func TestNewDialog_SandboxCheckbox_SpaceToggle(t *testing.T) {
 	dialog := NewNewDialog()
 	dialog.Show()
 	dialog.sandboxEnabled = false // Ensure known initial state.
-	dialog.focusIndex = 4         // Sandbox checkbox
+	dialog.focusIndex = 5         // Sandbox checkbox
 
 	// Space toggles sandbox on.
 	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
@@ -870,7 +911,7 @@ func TestNewDialog_SandboxCheckbox_SpaceToggle(t *testing.T) {
 	}
 
 	// Space again toggles off.
-	dialog.focusIndex = 4
+	dialog.focusIndex = 5
 	dialog, _ = dialog.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
 
 	if dialog.sandboxEnabled {
@@ -884,7 +925,7 @@ func TestNewDialog_CheckboxesFocusIndependently(t *testing.T) {
 	dialog.Show()
 
 	// Focus on worktree checkbox — only it should highlight.
-	dialog.focusIndex = 3
+	dialog.focusIndex = 4
 	view := dialog.View()
 
 	// Worktree line should have the focus indicator.
@@ -893,7 +934,7 @@ func TestNewDialog_CheckboxesFocusIndependently(t *testing.T) {
 	}
 
 	// Focus on sandbox checkbox — only it should highlight.
-	dialog.focusIndex = 4
+	dialog.focusIndex = 5
 	view = dialog.View()
 
 	if !strings.Contains(view, "Run in Docker sandbox") {
@@ -975,7 +1016,7 @@ func TestNewDialog_SoftSelect_TypeClearsField(t *testing.T) {
 	d.Show()
 
 	// Move focus to path field
-	d.focusIndex = 1
+	d.focusIndex = 2
 	d.updateFocus()
 
 	originalPath := d.pathInput.Value()
@@ -1004,7 +1045,7 @@ func TestNewDialog_SoftSelect_BackspaceClearsField(t *testing.T) {
 	d.SetSize(80, 40)
 	d.Show()
 
-	d.focusIndex = 1
+	d.focusIndex = 2
 	d.updateFocus()
 
 	if !d.pathSoftSelected {
@@ -1027,7 +1068,7 @@ func TestNewDialog_SoftSelect_MovementExits(t *testing.T) {
 	d.SetSize(80, 40)
 	d.Show()
 
-	d.focusIndex = 1
+	d.focusIndex = 2
 	d.updateFocus()
 
 	originalPath := d.pathInput.Value()
@@ -1052,7 +1093,7 @@ func TestNewDialog_SoftSelect_TabPreservesValue(t *testing.T) {
 	d.SetSize(80, 40)
 	d.Show()
 
-	d.focusIndex = 1
+	d.focusIndex = 2
 	d.updateFocus()
 
 	originalPath := d.pathInput.Value()
@@ -1068,8 +1109,8 @@ func TestNewDialog_SoftSelect_TabPreservesValue(t *testing.T) {
 		t.Errorf("path = %q, want %q (Tab should preserve value)", d.pathInput.Value(), originalPath)
 	}
 	// Focus should have moved forward
-	if d.focusIndex != 2 {
-		t.Errorf("focusIndex = %d, want 2 (should move to command)", d.focusIndex)
+	if d.focusIndex != 3 {
+		t.Errorf("focusIndex = %d, want 3 (should move to command)", d.focusIndex)
 	}
 }
 
@@ -1081,7 +1122,7 @@ func TestNewDialog_SoftSelect_CtrlNExits(t *testing.T) {
 	suggestions := []string{"/path/one", "/path/two"}
 	d.SetPathSuggestions(suggestions)
 
-	d.focusIndex = 1
+	d.focusIndex = 2
 	d.updateFocus()
 
 	if !d.pathSoftSelected {
@@ -1104,7 +1145,7 @@ func TestNewDialog_SoftSelect_ReactivatesOnRefocus(t *testing.T) {
 	d.SetSize(80, 40)
 	d.Show()
 
-	d.focusIndex = 1
+	d.focusIndex = 2
 	d.updateFocus()
 
 	// Exit soft-select by typing
@@ -1120,8 +1161,8 @@ func TestNewDialog_SoftSelect_ReactivatesOnRefocus(t *testing.T) {
 	// Shift+Tab back to path
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
 
-	if d.focusIndex != 1 {
-		t.Fatalf("focusIndex = %d, want 1", d.focusIndex)
+	if d.focusIndex != 2 {
+		t.Fatalf("focusIndex = %d, want 2", d.focusIndex)
 	}
 	if !d.pathSoftSelected {
 		t.Error("pathSoftSelected should reactivate when refocusing path field with value")

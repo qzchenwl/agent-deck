@@ -756,7 +756,7 @@ func TestSetupConductor_DefaultTemplate(t *testing.T) {
 	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
 
 	// Setup without custom path (uses default template)
-	err := SetupConductor(name, profile, true, true, "test description", "", "")
+	err := SetupConductor(name, profile, true, true, "test description", "", "", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -812,7 +812,7 @@ func TestSetupConductor_CustomSymlink(t *testing.T) {
 	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
 
 	// Setup with custom path (creates symlink)
-	err := SetupConductor(name, profile, true, true, "test description", customPath, "")
+	err := SetupConductor(name, profile, true, true, "test description", customPath, "", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -842,7 +842,7 @@ func TestSetupConductor_EmptyProfileNormalizesToDefault(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 
 	name := "default-profile-conductor"
-	if err := SetupConductor(name, "", true, true, "", "", ""); err != nil {
+	if err := SetupConductor(name, "", true, true, "", "", "", nil, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -869,11 +869,11 @@ func TestSetupConductor_ProfileConflict(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 
 	name := "profile-conflict"
-	if err := SetupConductor(name, "work", true, true, "", "", ""); err != nil {
+	if err := SetupConductor(name, "work", true, true, "", "", "", nil, ""); err != nil {
 		t.Fatalf("first setup failed: %v", err)
 	}
 
-	err := SetupConductor(name, "personal", true, true, "", "", "")
+	err := SetupConductor(name, "personal", true, true, "", "", "", nil, "")
 	if err == nil {
 		t.Fatal("expected conflict error when reusing conductor name across profiles")
 	}
@@ -999,6 +999,9 @@ func TestGenerateSystemdHeartbeatService_IncludesAgentDeckDir(t *testing.T) {
 func TestGenerateHeartbeatPlist_IncludesAgentDeckDir(t *testing.T) {
 	plist, err := GenerateHeartbeatPlist("test-conductor", 15)
 	if err != nil {
+		if strings.Contains(err.Error(), "not found in PATH") {
+			t.Skipf("skipping: %v", err)
+		}
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if strings.Contains(plist, "__PATH__") {
@@ -1017,6 +1020,9 @@ func TestGenerateHeartbeatPlist_IncludesAgentDeckDir(t *testing.T) {
 func TestGenerateLaunchdPlist_IncludesAgentDeckDir(t *testing.T) {
 	plist, err := GenerateLaunchdPlist()
 	if err != nil {
+		if strings.Contains(err.Error(), "not found in PATH") {
+			t.Skipf("skipping: %v", err)
+		}
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// Verify no __PATH__ placeholder remains
@@ -1238,7 +1244,7 @@ func TestSetupConductor_PolicyOverride(t *testing.T) {
 	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
 
 	// Setup with custom policy path (creates per-conductor symlink)
-	err := SetupConductor(name, profile, true, true, "test description", "", customPolicyPath)
+	err := SetupConductor(name, profile, true, true, "test description", "", customPolicyPath, nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1417,7 +1423,7 @@ func TestSetupConductorCreatesLearnings(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 
 	name := "learnings-test"
-	if err := SetupConductor(name, "default", true, true, "", "", ""); err != nil {
+	if err := SetupConductor(name, "default", true, true, "", "", "", nil, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -1442,7 +1448,7 @@ func TestSetupConductorPreservesExistingLearnings(t *testing.T) {
 
 	name := "learnings-preserve"
 	// First setup creates the file
-	if err := SetupConductor(name, "default", true, true, "", "", ""); err != nil {
+	if err := SetupConductor(name, "default", true, true, "", "", "", nil, ""); err != nil {
 		t.Fatalf("first setup failed: %v", err)
 	}
 
@@ -1455,7 +1461,7 @@ func TestSetupConductorPreservesExistingLearnings(t *testing.T) {
 	}
 
 	// Re-running setup should NOT overwrite
-	if err := SetupConductor(name, "default", true, true, "", "", ""); err != nil {
+	if err := SetupConductor(name, "default", true, true, "", "", "", nil, ""); err != nil {
 		t.Fatalf("second setup failed: %v", err)
 	}
 
@@ -2016,5 +2022,128 @@ func TestGetHeartbeatInterval_ZeroMeansDisabled(t *testing.T) {
 				t.Errorf("GetHeartbeatInterval() with %d = %d, want %d", tt.interval, got, tt.expected)
 			}
 		})
+	}
+}
+
+// --- Slack markdown-to-mrkdwn converter tests ---
+
+func TestBridgeTemplate_ContainsMarkdownToSlackConverter(t *testing.T) {
+	template := conductorBridgePy
+
+	// Function definition must exist.
+	if !strings.Contains(template, "def _markdown_to_slack(text: str) -> str:") {
+		t.Error("template should contain _markdown_to_slack function definition")
+	}
+
+	// Header conversion regex.
+	if !strings.Contains(template, `^#{1,6}\s+`) {
+		t.Error("template should contain GFM header regex ^#{1,6}\\s+")
+	}
+
+	// Bold conversion: **text** -> *text*.
+	if !strings.Contains(template, `\*\*(.+?)\*\*`) {
+		t.Error("template should contain bold regex \\*\\*(.+?)\\*\\*")
+	}
+
+	// Strikethrough conversion: ~~text~~ -> ~text~.
+	if !strings.Contains(template, `~~(.+?)~~`) {
+		t.Error("template should contain strikethrough regex ~~(.+?)~~")
+	}
+
+	// Link conversion: [text](url) -> <url|text>.
+	if !strings.Contains(template, `\[([^\]]+)\]\(([^)]+)\)`) {
+		t.Error("template should contain link regex \\[([^\\]]+)\\]\\(([^)]+)\\)")
+	}
+
+	// Bullet list conversion.
+	if !strings.Contains(template, `^(\s*)[-*]\s+`) {
+		t.Error("template should contain bullet list regex ^(\\s*)[-*]\\s+")
+	}
+
+	// Code block protection.
+	if !strings.Contains(template, "code_blocks = []") {
+		t.Error("template should contain code block protection list")
+	}
+
+	// Inline code protection.
+	if !strings.Contains(template, "inline_codes = []") {
+		t.Error("template should contain inline code protection list")
+	}
+}
+
+func TestBridgeTemplate_SafeSayConvertsMarkdown(t *testing.T) {
+	template := conductorBridgePy
+
+	// _safe_say must call _markdown_to_slack.
+	if !strings.Contains(template, "_markdown_to_slack(kwargs[\"text\"])") {
+		t.Error("_safe_say should apply _markdown_to_slack to kwargs[\"text\"]")
+	}
+
+	// The conversion must be conditional on "text" being in kwargs.
+	if !strings.Contains(template, `if "text" in kwargs:`) {
+		t.Error("_safe_say should guard _markdown_to_slack call with 'if \"text\" in kwargs:'")
+	}
+}
+
+func TestSetupConductor_WithEnvVars(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "test-env-conductor"
+	env := map[string]string{
+		"ANTHROPIC_BASE_URL":   "https://api.z.ai/api/anthropic",
+		"ANTHROPIC_AUTH_TOKEN": "test-token",
+	}
+	err := SetupConductor(name, "default", true, true, "env test", "", "", env, "~/.conductor.env")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+
+	if len(meta.Env) != 2 {
+		t.Errorf("expected 2 env vars, got %d", len(meta.Env))
+	}
+	if meta.Env["ANTHROPIC_BASE_URL"] != "https://api.z.ai/api/anthropic" {
+		t.Errorf("unexpected ANTHROPIC_BASE_URL: %s", meta.Env["ANTHROPIC_BASE_URL"])
+	}
+	if meta.EnvFile != "~/.conductor.env" {
+		t.Errorf("unexpected env_file: %s", meta.EnvFile)
+	}
+
+	// Verify restricted file permissions when env vars present
+	dir, _ := ConductorNameDir(name)
+	info, err := os.Stat(filepath.Join(dir, "meta.json"))
+	if err != nil {
+		t.Fatalf("failed to stat meta.json: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("expected 0600 permissions for meta.json with env vars, got %o", info.Mode().Perm())
+	}
+}
+
+func TestSetupConductor_WithoutEnvVars(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "test-no-env-conductor"
+	err := SetupConductor(name, "default", true, true, "", "", "", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+
+	if meta.Env != nil {
+		t.Errorf("expected nil env, got %v", meta.Env)
+	}
+	if meta.EnvFile != "" {
+		t.Errorf("expected empty env_file, got %s", meta.EnvFile)
 	}
 }

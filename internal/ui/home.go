@@ -10,7 +10,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -328,6 +330,10 @@ type Home struct {
 	// Full repaint mode: issue tea.ClearScreen every tick to avoid
 	// incremental redraw drift in terminals with unicode grapheme widths
 	fullRepaint bool
+
+	// Performance observability (debug mode only, zero cost when off)
+	debugMode          bool         // true when AGENTDECK_DEBUG=1, enables perf overlay
+	lastRenderDuration atomic.Int64 // microseconds, for debug status bar
 
 	// Reusable string builder for View() to reduce allocations
 	viewBuilder strings.Builder
@@ -665,6 +671,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		boundKeys:            make(map[string]string),
 		undoStack:            make([]deletedSessionEntry, 0, 10),
 		pendingTitleChanges:  make(map[string]string),
+		debugMode:            logging.IsDebugEnabled(),
 	}
 	h.sessionRenderSnapshot.Store(make(map[string]sessionRenderState))
 
@@ -1493,6 +1500,7 @@ func (h *Home) propagateThemeToSessions() {
 		for _, inst := range instances {
 			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil && tmuxSess.Exists() {
 				_ = tmuxSess.SetEnvironment("COLORFGBG", colorfgbg)
+				_ = tmuxSess.ApplyThemeOptions()
 			}
 		}
 	}()
@@ -2130,6 +2138,12 @@ func (h *Home) backgroundStatusUpdate() {
 	totalStart := time.Now()
 	if hotUntil := h.navigationHotUntil.Load(); hotUntil > 0 && time.Now().UnixNano() < hotUntil {
 		return
+	}
+
+	// Track this tick with the slow-op detector (warns if stuck >3s)
+	if sod := logging.SlowOps(); sod != nil {
+		opID := sod.Start("background_status_update")
+		defer sod.Finish(opID)
 	}
 
 	// Refresh tmux session cache
@@ -4157,6 +4171,13 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.String() {
 	case "enter":
+		// When multi-repo path list is focused, let the dialog handle enter (edit/save path).
+		if h.newDialog.IsMultiRepoEditing() {
+			var cmd tea.Cmd
+			h.newDialog, cmd = h.newDialog.Update(msg)
+			return h, cmd
+		}
+
 		// Validate before creating session
 		if validationErr := h.newDialog.Validate(); validationErr != "" {
 			h.newDialog.SetError(validationErr)
@@ -4221,6 +4242,13 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		geminiYoloMode := h.newDialog.IsGeminiYoloMode()
 		sandboxMode := h.newDialog.IsSandboxEnabled()
+		multiRepoPaths, multiRepoEnabled := h.newDialog.GetMultiRepoPaths()
+		var additionalPaths []string
+		if multiRepoEnabled && len(multiRepoPaths) > 1 {
+			// First path stays as ProjectPath, rest are additional
+			path = multiRepoPaths[0]
+			additionalPaths = multiRepoPaths[1:]
+		}
 
 		return h, h.createSessionInGroupWithWorktreeAndOptions(
 			name,
@@ -4233,6 +4261,8 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			geminiYoloMode,
 			sandboxMode,
 			toolOptionsJSON,
+			multiRepoEnabled,
+			additionalPaths,
 		)
 
 	case "esc":
@@ -5297,6 +5327,8 @@ func (h *Home) handleConfirmDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				false,
 				false,
 				pendingToolOpts,
+				false,
+				nil,
 			)
 		case "n", "N", "esc":
 			h.confirmDialog.Hide()
@@ -5992,6 +6024,8 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 	geminiYoloMode bool,
 	sandboxEnabled bool,
 	toolOptionsJSON json.RawMessage,
+	multiRepoEnabled bool,
+	additionalPaths []string,
 ) tea.Cmd {
 	return func() tea.Msg {
 		// Check tmux availability before creating session
@@ -5999,9 +6033,8 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 			return sessionCreatedMsg{err: fmt.Errorf("cannot create session: %w", err)}
 		}
 
-		if worktreePath != "" && worktreeRepoRoot != "" && worktreeBranch != "" {
-			// Worktree creation can be slow on large repos; keep it in async cmd path
-			// so the TUI remains responsive.
+		if worktreePath != "" && worktreeRepoRoot != "" && worktreeBranch != "" && !multiRepoEnabled {
+			// Single-repo worktree: create here. Multi-repo worktrees are handled below.
 			//
 			// Check for an existing worktree for this branch before creating a new one.
 			if existingPath, err := git.GetWorktreeForBranch(worktreeRepoRoot, worktreeBranch); err == nil && existingPath != "" {
@@ -6064,6 +6097,115 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 		// Apply sandbox config.
 		if sandboxEnabled {
 			inst.Sandbox = session.NewSandboxConfig("")
+		}
+
+		// Apply multi-repo config.
+		if multiRepoEnabled && len(additionalPaths) > 0 {
+			inst.MultiRepoEnabled = true
+			inst.AdditionalPaths = additionalPaths
+			allPaths := inst.AllProjectPaths()
+
+			if worktreeBranch != "" {
+				// Multi-repo + worktree: create a persistent parent dir with all worktrees inside.
+				// Layout: ~/.agent-deck/multi-repo-worktrees/<branch>-<id>/<repo-name>/
+				home, _ := os.UserHomeDir()
+				sanitizedBranch := strings.ReplaceAll(worktreeBranch, "/", "-")
+				sanitizedBranch = strings.ReplaceAll(sanitizedBranch, " ", "-")
+				parentDir := filepath.Join(home, ".agent-deck", "multi-repo-worktrees",
+					fmt.Sprintf("%s-%s", sanitizedBranch, inst.ID[:8]))
+				if mkErr := os.MkdirAll(parentDir, 0o755); mkErr != nil {
+					return sessionCreatedMsg{err: fmt.Errorf("failed to create multi-repo worktree dir: %w", mkErr)}
+				}
+				if resolved, evalErr := filepath.EvalSymlinks(parentDir); evalErr == nil {
+					parentDir = resolved
+				}
+				inst.MultiRepoTempDir = parentDir
+
+				// Create worktrees inside parentDir, named after each repo
+				dirnames := session.DeduplicateDirnames(allPaths)
+				var newProjectPath string
+				var newAdditionalPaths []string
+				for i, p := range allPaths {
+					wtPath := filepath.Join(parentDir, dirnames[i])
+					if git.IsGitRepo(p) {
+						repoRoot, rootErr := git.GetWorktreeBaseRoot(p)
+						if rootErr != nil {
+							uiLog.Warn("multi_repo_worktree_skip", slog.String("path", p), slog.String("error", rootErr.Error()))
+							// Copy path as-is into the parent dir via symlink
+							_ = os.Symlink(p, wtPath)
+							if i == 0 {
+								newProjectPath = wtPath
+							} else {
+								newAdditionalPaths = append(newAdditionalPaths, wtPath)
+							}
+							continue
+						}
+						if err := git.CreateWorktree(repoRoot, wtPath, worktreeBranch); err != nil {
+							uiLog.Warn("multi_repo_worktree_create_fail", slog.String("path", p), slog.String("error", err.Error()))
+							_ = os.Symlink(p, wtPath)
+							if i == 0 {
+								newProjectPath = wtPath
+							} else {
+								newAdditionalPaths = append(newAdditionalPaths, wtPath)
+							}
+							continue
+						}
+						inst.MultiRepoWorktrees = append(inst.MultiRepoWorktrees, session.MultiRepoWorktree{
+							OriginalPath: p,
+							WorktreePath: wtPath,
+							RepoRoot:     repoRoot,
+							Branch:       worktreeBranch,
+						})
+						if i == 0 {
+							newProjectPath = wtPath
+						} else {
+							newAdditionalPaths = append(newAdditionalPaths, wtPath)
+						}
+					} else {
+						// Non-git paths: symlink into parent dir
+						_ = os.Symlink(p, wtPath)
+						if i == 0 {
+							newProjectPath = wtPath
+						} else {
+							newAdditionalPaths = append(newAdditionalPaths, wtPath)
+						}
+					}
+				}
+				inst.ProjectPath = newProjectPath
+				inst.AdditionalPaths = newAdditionalPaths
+			} else {
+				// Multi-repo without worktree: create a persistent parent dir with symlinks.
+				home, _ := os.UserHomeDir()
+				parentDir := filepath.Join(home, ".agent-deck", "multi-repo-worktrees", inst.ID[:8])
+				if mkErr := os.MkdirAll(parentDir, 0o755); mkErr != nil {
+					return sessionCreatedMsg{err: fmt.Errorf("failed to create multi-repo dir: %w", mkErr)}
+				}
+				if resolved, evalErr := filepath.EvalSymlinks(parentDir); evalErr == nil {
+					parentDir = resolved
+				}
+				inst.MultiRepoTempDir = parentDir
+
+				// Create symlinks for all paths
+				dirnames := session.DeduplicateDirnames(allPaths)
+				var newProjectPath string
+				var newAdditionalPaths []string
+				for i, p := range allPaths {
+					linkPath := filepath.Join(parentDir, dirnames[i])
+					_ = os.Symlink(p, linkPath)
+					if i == 0 {
+						newProjectPath = linkPath
+					} else {
+						newAdditionalPaths = append(newAdditionalPaths, linkPath)
+					}
+				}
+				inst.ProjectPath = newProjectPath
+				inst.AdditionalPaths = newAdditionalPaths
+			}
+
+			// Update tmux session working directory to the parent dir
+			if inst.GetTmuxSession() != nil {
+				inst.GetTmuxSession().WorkDir = inst.MultiRepoTempDir
+			}
 		}
 
 		uiLog.Info("session_create_starting",
@@ -6199,6 +6341,7 @@ func (h *Home) quickCreateSession() tea.Cmd {
 		name, projectPath, command, groupPath,
 		"", "", "", // no worktree
 		geminiYoloMode, false, toolOptionsJSON,
+		false, nil, // no multi-repo
 	)
 }
 
@@ -6297,6 +6440,45 @@ func (h *Home) forkSessionCmdWithOptions(
 			inst.Sandbox = session.NewSandboxConfig("")
 		}
 
+		// Propagate multi-repo config from source.
+		if source.IsMultiRepo() {
+			inst.MultiRepoEnabled = true
+			inst.AdditionalPaths = append([]string{}, source.AdditionalPaths...)
+			// Copy worktree tracking from source (shared worktrees)
+			if len(source.MultiRepoWorktrees) > 0 {
+				inst.MultiRepoWorktrees = append([]session.MultiRepoWorktree{}, source.MultiRepoWorktrees...)
+			}
+			// Create a new persistent dir for the fork with symlinks to shared worktrees
+			home, _ := os.UserHomeDir()
+			parentDir := filepath.Join(home, ".agent-deck", "multi-repo-worktrees", inst.ID[:8])
+			if mkErr := os.MkdirAll(parentDir, 0o755); mkErr != nil {
+				return sessionForkedMsg{err: fmt.Errorf("failed to create multi-repo dir: %w", mkErr), sourceID: sourceID}
+			}
+			if resolved, evalErr := filepath.EvalSymlinks(parentDir); evalErr == nil {
+				parentDir = resolved
+			}
+			inst.MultiRepoTempDir = parentDir
+			if inst.GetTmuxSession() != nil {
+				inst.GetTmuxSession().WorkDir = parentDir
+			}
+			// Recreate symlinks/entries in new parent dir pointing to source worktree paths
+			allPaths := inst.AllProjectPaths()
+			dirnames := session.DeduplicateDirnames(allPaths)
+			var newProjectPath string
+			var newAdditionalPaths []string
+			for i, p := range allPaths {
+				linkPath := filepath.Join(parentDir, dirnames[i])
+				_ = os.Symlink(p, linkPath)
+				if i == 0 {
+					newProjectPath = linkPath
+				} else {
+					newAdditionalPaths = append(newAdditionalPaths, linkPath)
+				}
+			}
+			inst.ProjectPath = newProjectPath
+			inst.AdditionalPaths = newAdditionalPaths
+		}
+
 		if err := inst.Start(); err != nil {
 			return sessionForkedMsg{err: err, sourceID: sourceID}
 		}
@@ -6335,11 +6517,25 @@ func (h *Home) deleteSession(inst *session.Instance) tea.Cmd {
 	isWorktree := inst.IsWorktree()
 	worktreePath := inst.WorktreePath
 	worktreeRepoRoot := inst.WorktreeRepoRoot
+	isMultiRepo := inst.IsMultiRepo()
+	multiRepoTempDir := inst.MultiRepoTempDir
+	multiRepoWorktrees := inst.MultiRepoWorktrees
 	return func() tea.Msg {
 		killErr := inst.Kill()
 		if isWorktree {
 			_ = git.RemoveWorktree(worktreeRepoRoot, worktreePath, false)
 			_ = git.PruneWorktrees(worktreeRepoRoot)
+		}
+		if isMultiRepo {
+			// Clean up multi-repo temp directory
+			if multiRepoTempDir != "" {
+				_ = os.RemoveAll(multiRepoTempDir)
+			}
+			// Clean up per-repo worktrees
+			for _, wt := range multiRepoWorktrees {
+				_ = git.RemoveWorktree(wt.RepoRoot, wt.WorktreePath, false)
+				_ = git.PruneWorktrees(wt.RepoRoot)
+			}
 		}
 		return sessionDeletedMsg{deletedID: id, killErr: killErr}
 	}
@@ -6932,6 +7128,11 @@ func (h *Home) View() string {
 		return "Loading..."
 	}
 
+	var renderStart time.Time
+	if logging.IsDebugEnabled() {
+		renderStart = time.Now()
+	}
+
 	// Check minimum terminal size for usability
 	if h.width < minTerminalWidth || h.height < minTerminalHeight {
 		return lipgloss.Place(
@@ -7138,8 +7339,12 @@ func (h *Home) View() string {
 	// MAIN CONTENT AREA - Responsive layout based on terminal width
 	// ═══════════════════════════════════════════════════════════════════
 	helpBarHeight := 2 // Help bar takes 2 lines (border + content)
-	// Height breakdown: -1 header, -filterBarHeight filter, -updateBannerHeight banner, -maintenanceBannerHeight maintenance, -helpBarHeight help
-	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight
+	debugBarHeight := 0
+	if h.debugMode {
+		debugBarHeight = 1
+	}
+	// Height breakdown: -1 header, -filterBarHeight filter, -updateBannerHeight banner, -maintenanceBannerHeight maintenance, -helpBarHeight help, -debugBarHeight debug
+	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
 
 	// Route to appropriate layout based on terminal width
 	layoutMode := h.getLayoutMode()
@@ -7165,6 +7370,12 @@ func (h *Home) View() string {
 	helpBar := h.renderHelpBar()
 	b.WriteString(helpBar)
 
+	// Debug performance overlay (AGENTDECK_DEBUG=1 only)
+	if h.debugMode {
+		b.WriteString("\n")
+		b.WriteString(h.renderDebugBar())
+	}
+
 	// Error and warning messages are displayed but may be truncated by final height constraint
 	if h.err != nil {
 		remaining := 5*time.Second - time.Since(h.errTime)
@@ -7188,6 +7399,19 @@ func (h *Home) View() string {
 		warnStyle := lipgloss.NewStyle().Foreground(ColorYellow)
 		b.WriteString("\n")
 		b.WriteString(warnStyle.Render("⚠ " + h.watcherWarning))
+	}
+
+	// Performance: log render duration when debug mode is active
+	if logging.IsDebugEnabled() {
+		elapsed := time.Since(renderStart)
+		if elapsed > 50*time.Millisecond {
+			perfLog.Warn("slow_view_render", slog.Duration("elapsed", elapsed),
+				slog.Int("width", h.width), slog.Int("height", h.height),
+				slog.Int("sessions", len(h.flatItems)))
+		} else {
+			perfLog.Debug("view_render", slog.Duration("elapsed", elapsed))
+		}
+		h.lastRenderDuration.Store(elapsed.Microseconds())
 	}
 
 	// CRITICAL: Use ensureExactHeight for robust, consistent output across all platforms
@@ -8405,6 +8629,31 @@ func (h *Home) helpKey(key, desc string) string {
 	return keyStyle.Render(key) + " " + descStyle.Render(desc)
 }
 
+// renderDebugBar renders a compact performance overlay for debug mode.
+// Shows: render time, goroutine count, heap usage, session count.
+func (h *Home) renderDebugBar() string {
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	renderUs := h.lastRenderDuration.Load()
+	goroutines := runtime.NumGoroutine()
+	heapMB := float64(memStats.HeapAlloc) / (1024 * 1024)
+	sessionCount := len(h.flatItems)
+
+	debugText := fmt.Sprintf(
+		" DEBUG | render: %dus | goroutines: %d | heap: %.1fMB | items: %d ",
+		renderUs, goroutines, heapMB, sessionCount,
+	)
+
+	debugStyle := lipgloss.NewStyle().
+		Foreground(ColorBg).
+		Background(lipgloss.Color("#FF6600")).
+		Bold(true).
+		MaxWidth(h.width)
+
+	return debugStyle.Render(debugText)
+}
+
 // renderSessionList renders the left panel with hierarchical session list
 func (h *Home) renderSessionList(width, height int) string {
 	var b strings.Builder
@@ -8832,6 +9081,17 @@ func (h *Home) renderSessionItem(
 		sandboxBadge = sbStyle.Render(" [sandbox]")
 	}
 
+	// Multi-repo badge for multi-repo sessions.
+	multiRepoBadge := ""
+	if inst.IsMultiRepo() {
+		mrStyle := lipgloss.NewStyle().Foreground(ColorCyan)
+		if selected {
+			mrStyle = SessionStatusSelStyle
+		}
+		pathCount := len(inst.AllProjectPaths())
+		multiRepoBadge = mrStyle.Render(fmt.Sprintf(" [multi-repo: %d]", pathCount))
+	}
+
 	// SSH badge for remote sessions.
 	sshBadge := ""
 	if inst.IsSSH() {
@@ -8860,9 +9120,9 @@ func (h *Home) renderSessionItem(
 		windowChevron = chevronStyle.Render(chevronChar)
 	}
 
-	// Build row: [baseIndent][selection][tree][chevron][status] [title] [tool] [yolo] [worktree] [sandbox] [ssh]
+	// Build row: [baseIndent][selection][tree][chevron][status] [title] [tool] [yolo] [worktree] [sandbox] [multi-repo] [ssh]
 	row := fmt.Sprintf(
-		"%s%s%s%s%s %s%s%s%s%s%s",
+		"%s%s%s%s%s %s%s%s%s%s%s%s",
 		baseIndent,
 		selectionPrefix,
 		treeStyle.Render(treeConnector),
@@ -8873,6 +9133,7 @@ func (h *Home) renderSessionItem(
 		yoloBadge,
 		worktreeBadge,
 		sandboxBadge,
+		multiRepoBadge,
 		sshBadge,
 	)
 	b.WriteString(row)
@@ -9466,9 +9727,11 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Session info header box
+	// Cache status once to avoid races with background status updates
+	selectedStatus := selected.GetStatusThreadSafe()
 	statusIcon := "○"
 	statusColor := ColorTextDim
-	switch selected.Status {
+	switch selectedStatus {
 	case session.StatusRunning:
 		statusIcon = "●"
 		statusColor = ColorGreen
@@ -9484,7 +9747,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Header with session name and status
-	statusBadge := lipgloss.NewStyle().Foreground(statusColor).Render(statusIcon + " " + string(selected.Status))
+	statusBadge := lipgloss.NewStyle().Foreground(statusColor).Render(statusIcon + " " + string(selectedStatus))
 	nameStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
 	b.WriteString(nameStyle.Render(selected.Title))
 	b.WriteString("  ")
@@ -9500,7 +9763,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	// Activity time - shows when session was last active
 	activityTime := selected.GetLastActivityTime()
 	activityStr := formatRelativeTime(activityTime)
-	if selected.Status == session.StatusRunning {
+	if selectedStatus == session.StatusRunning {
 		activityStr = "active now"
 	}
 	b.WriteString(infoStyle.Render("⏱ " + activityStr))
@@ -9581,6 +9844,23 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(wtHintStyle.Render("Finish:  "))
 			b.WriteString(wtKeyStyle.Render(finishKey))
 			b.WriteString(wtHintStyle.Render(" merge + cleanup"))
+			b.WriteString("\n")
+		}
+	}
+
+	// Multi-repo info section
+	if selected.IsMultiRepo() {
+		mrHeader := renderSectionDivider("Multi-Repo", width-4)
+		b.WriteString(mrHeader)
+		b.WriteString("\n")
+
+		mrLabelStyle := lipgloss.NewStyle().Foreground(ColorText)
+		mrValueStyle := lipgloss.NewStyle().Foreground(ColorText)
+
+		for i, p := range selected.AllProjectPaths() {
+			label := fmt.Sprintf("  %d. ", i+1)
+			b.WriteString(mrLabelStyle.Render(label))
+			b.WriteString(mrValueStyle.Render(truncatePath(p, width-4-len(label))))
 			b.WriteString("\n")
 		}
 	}
@@ -9958,7 +10238,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Special handling for stopped state - user-intentional stop with resume guidance
-	if selected.Status == session.StatusStopped {
+	if selectedStatus == session.StatusStopped {
 		stoppedHeader := renderSectionDivider("Session Stopped", width-4)
 		b.WriteString(stoppedHeader)
 		b.WriteString("\n\n")
@@ -10011,7 +10291,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Special handling for error state - crash/unexpected failure with diagnostic guidance
-	if selected.Status == session.StatusError {
+	if selectedStatus == session.StatusError {
 		errorHeader := renderSectionDivider("Session Error", width-4)
 		b.WriteString(errorHeader)
 		b.WriteString("\n\n")
@@ -10175,9 +10455,9 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			}
 		} else if timeSinceStart < 15*time.Second {
 			// STATUS-BASED CHECK: Session ready when Running/Waiting/Idle
-			sessionReady := selected.Status == session.StatusRunning ||
-				selected.Status == session.StatusWaiting ||
-				selected.Status == session.StatusIdle
+			sessionReady := selectedStatus == session.StatusRunning ||
+				selectedStatus == session.StatusWaiting ||
+				selectedStatus == session.StatusIdle
 
 			if !sessionReady {
 				// Also check content for faster detection
@@ -10324,12 +10604,12 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			// from the captured terminal output pass through to display.
 			safeLine := stripControlCharsPreserveANSI(line)
 
-			// In light theme, remove background color ANSI sequences that
-			// cause dark background bands to bleed through (e.g., tool output
-			// uses ESC[40m..ESC[47m which remain dark on a light background).
-			// Foreground colors and text formatting are preserved.
+			// In light theme, remap captured ANSI background colors to the
+			// current preview surface instead of stripping them completely.
+			// This preserves the soft highlighted blocks used by tools like
+			// Codex without letting dark background bands bleed through.
 			if isLightTheme {
-				safeLine = stripANSIBackground(safeLine)
+				safeLine = remapANSIBackground(safeLine, previewSurfaceANSI())
 			}
 
 			// Check if visually empty (strip ANSI for this check)
@@ -10525,15 +10805,40 @@ func stripControlCharsPreserveANSI(s string) string {
 //   - ESC[40m..ESC[47m  — standard 8-color backgrounds
 //   - ESC[100m..ESC[107m — bright/high-intensity backgrounds
 //   - ESC[48;...m        — 256-color and true-color backgrounds (ESC[48;5;Nm / ESC[48;2;R;G;Bm)
-//   - ESC[49m            — default background reset
-var ansiBackgroundRE = regexp.MustCompile(`\x1b\[(?:4[0-7]|10[0-7]|48;[0-9;]+|49)m`)
+var ansiBackgroundRE = regexp.MustCompile(`\x1b\[(?:4[0-7]|10[0-7]|48;[0-9;]+)m`)
 
-// stripANSIBackground removes ANSI background color sequences from a line
-// while preserving all other ANSI sequences (foreground colors, bold, italic,
-// underline). Used in light theme to prevent dark background bleed-through
-// from captured tmux pane output.
-func stripANSIBackground(s string) string {
-	return ansiBackgroundRE.ReplaceAllString(s, "")
+// previewSurfaceANSI returns a truecolor ANSI background sequence matching
+// the current preview surface. Falls back to empty string if the color is not
+// a hex RGB value.
+func previewSurfaceANSI() string {
+	hex := strings.TrimPrefix(string(ColorSurface), "#")
+	if len(hex) != 6 {
+		return ""
+	}
+	r, err := strconv.ParseUint(hex[0:2], 16, 8)
+	if err != nil {
+		return ""
+	}
+	g, err := strconv.ParseUint(hex[2:4], 16, 8)
+	if err != nil {
+		return ""
+	}
+	b, err := strconv.ParseUint(hex[4:6], 16, 8)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("\x1b[48;2;%d;%d;%dm", r, g, b)
+}
+
+// remapANSIBackground replaces ANSI background color sequences with the
+// provided replacement while preserving all other ANSI sequences (foreground
+// colors, bold, italic, underline). Used in light theme so captured terminal
+// output keeps soft highlighted regions instead of dropping them entirely.
+func remapANSIBackground(s, replacement string) string {
+	if replacement == "" {
+		return ansiBackgroundRE.ReplaceAllString(s, "")
+	}
+	return ansiBackgroundRE.ReplaceAllString(s, replacement)
 }
 
 // truncatePath shortens a path to fit within maxLen display width
