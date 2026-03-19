@@ -40,6 +40,7 @@ type settingDisplay struct {
 // NewDialog represents the new session creation dialog.
 type NewDialog struct {
 	nameInput            textinput.Model
+	generatedName        string
 	pathInput            textinput.Model
 	commandInput         textinput.Model
 	claudeOptions        *ClaudeOptionsPanel // Claude-specific options (concrete for value extraction).
@@ -211,6 +212,8 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 	d.focusIndex = 0
 	d.validationErr = ""
 	d.nameInput.SetValue("")
+	d.generatedName = session.GenerateSessionName()
+	d.nameInput.Placeholder = d.generatedName
 	d.nameInput.Focus()
 	d.suggestionNavigated = false // reset on show
 	d.pathSuggestionCursor = 0    // reset cursor too
@@ -256,7 +259,7 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string) {
 		d.inheritedSettings = buildInheritedSettings(userConfig.Docker)
 		d.branchPrefix = userConfig.Worktree.Prefix()
 	}
-	d.branchInput.Placeholder = d.branchPrefix + "branch-name"
+	d.branchInput.Placeholder = d.branchPrefix + d.generatedName
 	d.rebuildFocusTargets()
 }
 
@@ -306,6 +309,11 @@ func (d *NewDialog) SetPathSuggestions(paths []string) {
 // IsRecentPickerOpen returns whether the recent sessions picker is visible.
 func (d *NewDialog) IsRecentPickerOpen() bool {
 	return d.showRecentPicker && len(d.recentSessions) > 0
+}
+
+// IsBranchPickerOpen returns whether the inline branch result list is visible.
+func (d *NewDialog) IsBranchPickerOpen() bool {
+	return d.branchPicker != nil && d.branchPicker.IsVisible()
 }
 
 // SetRecentSessions sets the list of recently deleted session configs.
@@ -485,6 +493,9 @@ func (d *NewDialog) IsVisible() bool {
 // GetValues returns the current dialog values with expanded paths
 func (d *NewDialog) GetValues() (name, path, command string) {
 	name = strings.TrimSpace(d.nameInput.Value())
+	if name == "" {
+		name = d.generatedName
+	}
 	// Fix: sanitize input to remove surrounding quotes that cause path issues
 	path = strings.Trim(strings.TrimSpace(d.pathInput.Value()), "'\"")
 
@@ -520,9 +531,16 @@ func (d *NewDialog) ToggleWorktree() {
 
 // autoBranchFromName sets the branch input to "<prefix><session-name>" if the
 // name field is non-empty and the branch hasn't been manually edited.
+// When the name is empty but a generated name exists, it updates the placeholder instead.
 func (d *NewDialog) autoBranchFromName() {
 	name := strings.TrimSpace(d.nameInput.Value())
 	if name == "" {
+		// No user-typed name — show generated branch as placeholder only
+		if d.generatedName != "" {
+			d.branchInput.Placeholder = d.branchPrefix + d.generatedName
+		}
+		d.branchInput.SetValue("")
+		d.branchAutoSet = true
 		return
 	}
 	branch := d.branchPrefix + name
@@ -539,6 +557,9 @@ func (d *NewDialog) IsWorktreeEnabled() bool {
 func (d *NewDialog) GetValuesWithWorktree() (name, path, command, branch string, worktreeEnabled bool) {
 	name, path, command = d.GetValues()
 	branch = strings.TrimSpace(d.branchInput.Value())
+	if branch == "" && d.worktreeEnabled && name != "" {
+		branch = d.branchPrefix + name
+	}
 	worktreeEnabled = d.worktreeEnabled
 	return
 }
@@ -660,7 +681,10 @@ func (d *NewDialog) Validate() string {
 	// Fix: sanitize input to remove surrounding quotes that cause path issues
 	path := strings.Trim(strings.TrimSpace(d.pathInput.Value()), "'\"")
 
-	// Check for empty name
+	// Fall back to auto-generated name if user left it empty
+	if name == "" {
+		name = d.generatedName
+	}
 	if name == "" {
 		return "Session name cannot be empty"
 	}
@@ -699,6 +723,9 @@ func (d *NewDialog) Validate() string {
 	// Validate worktree branch if enabled
 	if d.worktreeEnabled {
 		branch := strings.TrimSpace(d.branchInput.Value())
+		if branch == "" && name != "" {
+			branch = d.branchPrefix + name
+		}
 		if branch == "" {
 			return "Branch name required for worktree"
 		}
@@ -883,6 +910,9 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 	case tea.KeyMsg:
 		if d.branchPicker != nil && d.branchPicker.IsVisible() {
 			if selected, handled := d.branchPicker.Update(msg); handled {
+				if d.branchPicker == nil || !d.branchPicker.IsVisible() {
+					d.branchInput.Focus()
+				}
 				if selected != "" {
 					d.branchInput.SetValue(selected)
 					d.branchInput.SetCursor(len(selected))
@@ -1042,10 +1072,11 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 					d.branchPicker = NewBranchPickerDialog()
 				}
 				d.branchPicker.SetSize(d.width, d.height)
-				if err := d.branchPicker.Show(d.worktreePickerPath()); err != nil {
+				if err := d.branchPicker.Show(d.worktreePickerPath(), d.branchInput.Value()); err != nil {
 					d.SetError(err.Error())
 				} else {
 					d.ClearError()
+					d.branchInput.Focus()
 				}
 				return d, nil
 			}
@@ -1300,6 +1331,9 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 		d.branchInput, cmd = d.branchInput.Update(msg)
 		if d.branchInput.Value() != oldBranch {
 			d.branchAutoSet = false
+			if d.branchPicker != nil && d.branchPicker.IsVisible() {
+				d.branchPicker.SetQuery(d.branchInput.Value())
+			}
 		}
 	case focusOptions:
 		if d.toolOptions != nil {
